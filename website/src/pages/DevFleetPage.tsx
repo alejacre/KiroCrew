@@ -578,7 +578,7 @@ export default function DevFleetPage() {
   const [confirmReq, setConfirmReq] = useState<{ title: string; desc: ReactNode; confirmLabel?: string; danger?: boolean; width?: number; resolve: (v: boolean) => void } | null>(null)
   const [restarting, setRestarting] = useState(false)
   // A cutover is dangerous BEFORE `restarting` goes true: makeLive() awaits the
-  // /make-live POST, and that request writes the systemd drop-in and issues the
+  // /make-live POST, and that request stages the live-target pointer and issues the
   // daemon-reload. A Restart fired inside that window can tear the gateway down
   // between the write and the reload, leaving persisted and loaded unit state
   // inconsistent. `restarting` only covers the wait AFTER the POST returns, so
@@ -971,8 +971,23 @@ export default function DevFleetPage() {
     if (!ok) return
     setFlag(w.name + ':makelive', true)
     try {
-      const r = await api.post<{ ok?: boolean; error?: string; start_id?: string | null }>('/make-live', { path: w.path })
+      const r = await api.post<{
+        ok?: boolean; error?: string; start_id?: string | null
+        staged_only?: boolean; notice?: string
+      }>('/make-live', { path: w.path })
       if (!r?.ok) { notify(r?.error || i18nT('pages.devFleetPage.make_live_failed'), { type: 'error' }); setFlag(w.name + ':makelive', false); return }
+      // Staged, not bounced: this gateway is not a service Dev Fleet can
+      // restart, so the operator finishes the cutover with the command the
+      // backend names in `notice`. There is no replacement process coming, so
+      // the restart overlay and the identity handshake must be skipped — waiting
+      // would strand the user on a 60s timeout and bury the one instruction they
+      // need.
+      if (r.staged_only) {
+        if (r.notice) notify(r.notice, { type: 'info' })
+        setFlag(w.name + ':makelive', false)
+        invalidateFleet()
+        return
+      }
       // Gateway is restarting into the new worktree — reuse the restart overlay
       // and the SAME identity handshake (a cutover is a restart into different
       // code, with the identical early-200 hazard). awaitGatewayBack reloads on
@@ -1065,16 +1080,19 @@ export default function DevFleetPage() {
             {iconLabel(<RotateCw size={13} className="lucide-inline" />, i18nT('pages.devFleetPage.restart'))}
           </Btn>
         )
-        // After a cutover to a feature worktree, main is dormant (is_live=false)
-        // and this inline control is the only way back to running main live.
-        // Consistent with makeLive()'s guard: shown iff the row is NOT live.
-        if (!w.is_live) {
-          out.push(
-            <Btn key="makelive" onClick={() => makeLive(w)} disabled={gatewayMutating} title={i18nT('pages.devFleetPage.repoint_the_live_gateway_back_at_main_restarts_t')}>
-              {iconLabel(<Rocket size={13} className="lucide-inline" />, i18nT('pages.devFleetPage.make_live'))}
-            </Btn>
-          )
-        }
+      }
+      // After a cutover to a feature worktree, main is dormant (is_live=false)
+      // and this inline control is the only way back to running main live. It sits
+      // OUTSIDE the gateway_service_active gate on purpose: staging a cutover
+      // needs no drivable service, and a host without one is precisely where
+      // gating it would strand the operator on a feature worktree with no route
+      // back. Consistent with makeLive()'s guard: shown iff the row is NOT live.
+      if (!w.is_live) {
+        out.push(
+          <Btn key="makelive" onClick={() => makeLive(w)} disabled={gatewayMutating} title={i18nT('pages.devFleetPage.repoint_the_live_gateway_back_at_main_restarts_t')}>
+            {iconLabel(<Rocket size={13} className="lucide-inline" />, i18nT('pages.devFleetPage.make_live'))}
+          </Btn>
+        )
       }
       if (fleet?.build_pending) {
         // Keep the visible text short: the ACTIONS grid column is fixed-width and
@@ -1098,9 +1116,10 @@ export default function DevFleetPage() {
       podsAvailable && w.has_dist && !w.running ? { label: i18nT('pages.devFleetPage.spin_up_pod'), icon: <Play size={13} className="lucide-inline" />, onClick: () => act(w.name, 'up') } : null,
       podsAvailable && w.running ? { label: i18nT('pages.devFleetPage.restart_pod'), icon: <RefreshCw size={13} className="lucide-inline" />, onClick: () => act(w.name, 'restart') } : null,
       { label: i18nT('pages.devFleetPage.rebase_onto_main'), icon: <RefreshCw size={13} className="lucide-inline" />, onClick: () => rebaseWorktree(w.name), disabled: !!busy[w.name + ':rebase'] },
-      // Make Live rewrites a systemd --user drop-in, so it needs the same host
-      // support pods do (the backend refuses with code "no_systemd" otherwise).
-      podsAvailable && !w.is_live ? { label: i18nT('pages.devFleetPage.make_live'), icon: <Rocket size={13} className="lucide-inline" />, onClick: () => makeLive(w), disabled: gatewayMutating, title: i18nT('pages.devFleetPage.repoint_the_live_gateway_at_this_worktree_restar') } : null,
+      // Staging a cutover writes only the live-target pointer, so it needs no
+      // pod support and no drivable service — gating it on podsAvailable would
+      // hide it on exactly the hosts it exists to serve.
+      !w.is_live ? { label: i18nT('pages.devFleetPage.make_live'), icon: <Rocket size={13} className="lucide-inline" />, onClick: () => makeLive(w), disabled: gatewayMutating, title: i18nT('pages.devFleetPage.repoint_the_live_gateway_at_this_worktree_restar') } : null,
       // QA + video drives the pod-e2e suite, which brings a pod up.
       podsAvailable ? { label: i18nT('pages.devFleetPage.qa_video'), icon: <Video size={13} className="lucide-inline" />, onClick: () => launchQa(w.name) } : null,
       podsAvailable && w.running ? { label: i18nT('pages.devFleetPage.stop_pod'), icon: <Square size={13} className="lucide-inline" />, onClick: () => act(w.name, 'down'), danger: true } : null,

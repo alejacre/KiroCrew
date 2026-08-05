@@ -2008,7 +2008,7 @@
       "nothing_selected": "Nothing selected",
       "nothing_to_prune": "Nothing to prune",
       "open": "Open",
-      "pod_and_make_live_actions_are_hidden_everything": "Pod and Make live actions are hidden; everything else on this page works normally.",
+      "pod_and_make_live_actions_are_hidden_everything": "Pod actions are hidden; everything else on this page works normally.",
       "pod_sick": "pod sick",
       "pod_start_failed": "Pod start failed",
       "pod_up": "pod up",

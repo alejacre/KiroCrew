@@ -4147,6 +4147,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     "profiles",
     "admission_policy.json",
     "denied_commands.json",
+    # Which checkout the gateway executes (Dev Fleet "Make live"). The pointer is
+    # resolved during startup and exec'd into, so a writable one is arbitrary
+    # code execution in the gateway's own identity — the agent must not be able
+    # to author it, and must not be able to read it back to discover a target to
+    # aim at either. Only the human-driven dashboard cutover writes it, and the
+    # gateway's own startup reader opens it directly rather than through this
+    # gate, so both keep working.
+    "live_target.json",
     # The computer-use primary enable ({enabled, allowed_apps, extra_denied_apps}).
     # Same class of control as ``denied_commands.json`` directly above, and here
     # for the same reason: flipping ``enabled`` grants full desktop observation
@@ -4442,6 +4450,37 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # ``marker.exists()``) is caught, not just the exact-leaf forms.
         rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves})(?:/|\s|$|['\"])"
     )
+    # The live-target pointer, anchored at every spelling of its directory: the
+    # $HOME-relative crew prefixes, the RESOLVED data home, and the literal
+    # ``$KIROCREW_HOME`` forms a shell line can carry unexpanded (the same reason
+    # ``home_alts`` accepts a literal ``$HOME``).
+    #
+    # Every other leaf here is anchored under $HOME, which misses a
+    # ``KIROCREW_HOME`` pointing outside it. That gap is tolerable for a
+    # credential (the file gate still blocks it, and reading is the worst case);
+    # it is not tolerable for this leaf, because the gateway EXECUTES what the
+    # pointer names, so a shell write is arbitrary code execution in the
+    # gateway's own identity. Anchored on the one filename rather than the whole
+    # data home so a home under a broad directory cannot over-match unrelated
+    # commands.
+    #
+    # The separator tolerates the shell noise that sits between a directory and a
+    # filename -- a closing quote (``"$KIROCREW_HOME"/live_target.json``) and
+    # repeated slashes (``$KIROCREW_HOME//live_target.json``) both name the same
+    # file, so matching only a single bare ``/`` would leave a bypass per form.
+    _lt = r"['\"]*/+live_target\.json"
+    live_target_dirs = [
+        rf"{home_alts}/(?:{wp_prefixes})",
+        re.escape("$KIROCREW_HOME"),
+        re.escape("${KIROCREW_HOME}"),
+    ]
+    try:
+        from kiro_crew.config.loader import config_dir
+
+        live_target_dirs.append(re.escape(str(Path(config_dir()))))
+    except Exception:  # noqa: BLE001 — an unresolvable home leaves the HOME anchor
+        pass
+    live_target_path = rf"(?:{'|'.join(live_target_dirs)}){_lt}(?:\s|$|['\"])"
     return re.compile(
         # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
         # appears anywhere as a token.  The token anchor accepts start-of-string
@@ -4456,7 +4495,8 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"(?:(?:{_READ_CMDS}.*|{_WRITE_CMDS}.*|{_SCRIPT_OPEN}.*|.*[<>|]\s*)"
         rf"{sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){sensitive_path}"
-        rf"|(?:^|.*[\s'\"=:,;]){write_protected_path})",
+        rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){live_target_path})",
         re.IGNORECASE,
     )
 
