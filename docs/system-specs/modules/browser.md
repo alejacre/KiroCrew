@@ -395,9 +395,15 @@ The schema is **nested** under a `browser` key — `{"browser": {"browserName":
 nothing, which presents as the branded-Chrome failure above rather than as a
 config error.
 
-**The generated config names the engine and nothing else.** Every added key
-becomes a default an operator must discover in order to override, and the engine
-is the only one the install flow already decided.
+**The generated config names the engine plus one conditional key.** Every added
+key becomes a default an operator must discover in order to override, and the
+engine is the only unconditional one the install flow already decided. The one
+conditional addition is `browser.contextOptions.storageState`, present only while
+the imported-cookies file (`<data-home>/browser-storage-state.json`) exists on
+disk: it points every new session at the cookies the owner imported (see
+[Imported cookies](#imported-cookies)). The import and clear handlers rewrite the
+config after they touch the file, so the key is present exactly when there is a
+state to load and absent again after a clear.
 
 **The browser sandbox is deliberately untouched.** Chromium's sandbox is a
 security boundary, so no generated default removes it. A host that cannot run it —
@@ -408,6 +414,52 @@ when `PLAYWRIGHT_MCP_CONFIG` is **already set** in the environment, Kiro Crew ad
 nothing and the operator's file wins entirely. Naming a config is how an operator
 selects a different engine, pins an `executablePath`, or accepts the sandbox
 trade-off on a host that requires it.
+
+### Imported cookies
+
+A remote gateway runs on a different machine from the browser the operator is
+logged into, so the agent's own `playwright-cli` sessions start with no session
+cookies. `browser_cli/cookies.py` closes that: the owner exports the cookies
+where they are logged in and imports them, the gateway normalises and stores them
+as a Playwright `storageState`, and the [launch config](#launch-config) names that
+file so every new session loads them. This replaces the hand-written
+`PLAYWRIGHT_MCP_CONFIG` that was previously the only path (issues #6546, #12319,
+#11382; Mesh-3859 / Mesh-3872).
+
+`parse_cookie_import(text)` accepts three shapes and normalises each to the
+Playwright cookie shape (`name`, `value`, `domain`, `path`, `expires` — a float
+or `-1` for a session cookie — `httpOnly`, `secure`, `sameSite` in `{Strict, Lax,
+None}`, defaulting to `Lax`):
+
+| Import shape | Source |
+|---|---|
+| `{"cookies": [...], "origins": [...]}` | a Playwright `storageState` (a `state-save` round-trip) |
+| a bare JSON array of cookie objects | Cookie-Editor / EditThisCookie / "Get cookies.txt" (`expirationDate`, wider `sameSite` vocabulary) |
+| Netscape `cookies.txt` | tab-separated, `#` comments, the `#HttpOnly_` domain prefix |
+
+Already-expired cookies are dropped; an input over 2 MiB, over 5000 cookies, or a
+cookie missing its `name`/`domain` is rejected with a `CookieImportError` carrying
+a user-readable message. `save_storage_state` writes the file atomically and
+owner-only (`0o600` on POSIX, an owner-only DACL on Windows via
+`atomic_write(restrict_to_owner=True)`, since a raw `mode` is a no-op there).
+`storage_state_summary` reports the cookie count, the distinct domains (leading
+dot stripped, sorted), the earliest positive expiry, and the file mtime as
+`imported_at` — and **never a cookie value**; nothing here returns or logs one.
+`hot_load_into_live_sessions` best-effort runs `state-load` against each live
+`kc-` session so a browser already open picks the cookies up, and never raises: a
+CLI that is absent or a session set that cannot be enumerated comes back as an
+empty result with a `note`, because new sessions get the cookies from the config
+regardless.
+
+The API contract (all three owner-only, refused in a restricted
+incognito/temporary session, and SEL-audited on import and clear with the cookie
+count and domains only):
+
+| Route | Response |
+|---|---|
+| `GET /api/browser/cookies` | `{present, summary\|null, config_path}` |
+| `POST /api/browser/cookies` `{content, filename?}` | `{ok, summary, hot_load}`; 400 malformed, 413 over 2 MiB, 403 non-owner |
+| `DELETE /api/browser/cookies` | `{ok, present: false}`; 403 non-owner |
 
 ### Snapshot retention
 
@@ -798,6 +850,7 @@ rather than showing the browser's own connection-refused page.
 | Agent reach into a `panel-` session | **Accepted residual.** A `panel-` browser can hold logins the human typed into it, and an agent drives the same CLI through its shell. What separates the populations is structural but not an enforcement boundary: an agent process runs under its own generated `PWTEST_DAEMON_SESSION_DIR`/`PWTEST_SOCKETS_DIR` namespace (see [Generated session reachability](#generated-session-reachability)), so a bare `playwright-cli -s=panel-… goto` from an agent shell resolves no session and its `list` does not show one; reaching the human's browser takes a command that also names the CLI's default registry and the gateway's socket root, both readable by a same-user process. The control on that command is the ordinary shell approval ladder, exactly as for every other `playwright-cli` invocation; the reserved prefix and the `web-browse` skill's rule are the conventions on top. An enforced isolation would be a per-population credential on the daemon socket, which the CLI does not offer |
 | Reveal | One JSON line to the `show` dashboard's own singleton socket under the gateway-owned socket root both children run with, only when the installed bundle carries that layout, after a successful launch; fails closed when there is no listener. `show -s=<name>` (no port) is never run, since with a stale socket it launches a Chromium app window on the host |
 | Saved state files | Owner-only permissions; they hold live session credentials |
+| Imported cookies (`GET`/`POST`/`DELETE /api/browser/cookies`) | Owner-only (cookie/token), the same guard as the view routes, and additionally refused in a restricted (incognito/temporary) session so an ephemeral session cannot persist a logged-in browser state. The stored `storageState` is owner-only; the summary and the SEL audit carry cookie counts and domains only, never a value; import and clear are both audited. Cookie-authed, deliberately NOT on any internal-path list — an agent never imports cookies |
 | Launch config | Write-protected from the agent on both the file-edit and shell gates, and readable. Deliberately anchored rather than bare-token: the filename is not itself the grant, since the agent can name its own `PLAYWRIGHT_MCP_CONFIG` — so what the entry removes is the durable form (rewriting the config the product installed), and a `cd`-relative write is the accepted residual, exactly as for `.data-home-ready` |
 | Page content | Treated as untrusted input. A URL, instruction, or form target read off a page never decides the next navigation |
 | Attach mode | Operates the operator's real logged-in browser, so it is the strongest form of the capability and remains behind shell approval |

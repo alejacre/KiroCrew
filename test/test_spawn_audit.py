@@ -1033,6 +1033,18 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # The agent's OWN browser commands are not spawned by us at all -- it
         # runs them as ordinary shell tool calls through the standard approval
         # path.
+        #   * ``cookies.py::_live_session_names`` runs ``playwright-cli list``
+        #     (fixed argv, no free element) and
+        #     ``cookies.py::hot_load_into_live_sessions`` runs
+        #     ``-s=kc-<8hex> state-load <path>`` once per live Kiro Crew session,
+        #     right after the dashboard OWNER imported cookies. The session names
+        #     come from ``list`` filtered to the reserved ``kc-`` prefix and the
+        #     path is Kiro Crew's own storage-state file under the data home, so
+        #     no request input reaches argv. The route is owner-only and refuses
+        #     internal-secret (agent) callers, same as ``launcher.py::_run_cli``;
+        #     not sandboxed for the same reason ``show`` is not.
+        "browser_cli/cookies.py::_live_session_names",
+        "browser_cli/cookies.py::hot_load_into_live_sessions",
         "browser_cli/install.py::_run",
         "browser_cli/launcher.py::_run_cli",
         "browser_cli/view.py::_spawn",

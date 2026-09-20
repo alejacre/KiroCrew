@@ -19,6 +19,8 @@ import { isScreenSnipSupported } from '../hooks/useScreenSnip'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { useBrowserView } from '../hooks/useBrowserView'
 import { useNativeBrowser } from '../hooks/useNativeBrowser'
+import { useBrowserCookies } from '../hooks/useBrowserCookies'
+import { CookieMenuItem, CookieHeaderButton, CookieChip, CookieDialog, CookieNewSessionHint } from './WebPreviewCookies'
 
 import { i18nT } from '../i18n/t'
 /**
@@ -745,6 +747,19 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // driven. There is no per-frame push to subscribe to any more: the view is a
   // process with a URL, so the panel polls its status and frames the URL.
   const view = useBrowserView(active)
+  // Imported browser cookies (a Playwright storageState the gateway applies to
+  // the agent's browser sessions). One hook instance for the whole panel, so the
+  // status is read once and there is a single dialog; the menu-item trigger, the
+  // header button, the chip and the dialog all read this same result. Owner-only:
+  // the pieces render nothing when `forbidden`.
+  const cookies = useBrowserCookies(active)
+  const [cookieDialogOpen, setCookieDialogOpen] = useState(false)
+  // Shown after an import the live session did not pick up; cleared on reopen.
+  const [cookieNewSessionHint, setCookieNewSessionHint] = useState(false)
+  const openCookieDialog = useCallback(() => {
+    setCookieNewSessionHint(false)
+    setCookieDialogOpen(true)
+  }, [])
   // Validate the server-reported URL before it becomes an iframe `src`. The
   // contract promises `http://127.0.0.1:<port>/`, and `normalizeUrl` rejects
   // anything that is not http(s) — so a malformed or hostile value degrades to
@@ -1598,6 +1613,10 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             <ExternalLink size={13} />
           </a>
         )}
+        {/* Import cookies — header button (no button-count guard here) + compact
+            chip, driven by the same shared hook + dialog as the toolbar. */}
+        <CookieHeaderButton cookies={cookies} onOpen={openCookieDialog} />
+        <CookieChip cookies={cookies} compact />
         {/* Same toggle as the one in the URL bar, in its pressed state — the bar
             is inert while this overlay is up, so the way back has to live here. */}
         <button
@@ -2044,6 +2063,12 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
         >
           {expanded ? <Minimize size={14} /> : <Expand size={14} />}
         </button>
+        {/* Imported-cookies status chip + post-import hint. The OPEN trigger is a
+            menu item inside the overflow dropdown below (not a toolbar button),
+            so the row's sibling-button count does not grow past its guard. The
+            chip is a span and the hint a span, so neither is counted either. */}
+        <CookieChip cookies={cookies} />
+        <CookieNewSessionHint show={cookieNewSessionHint} />
         {/* Divider */}
         <span aria-hidden="true" className="w-px h-5 bg-border shrink-0 mx-0.5" />
         {/* Overflow menu — collapses browser-view toggle AND device-size presets
@@ -2069,6 +2094,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
               <span>{i18nT('components.webPreviewPanel.browser_view')}</span>
               {viewRunning && <Check size={13} className="ml-auto shrink-0 text-accent" />}
             </DropdownMenuItem>
+            <CookieMenuItem cookies={cookies} onOpen={openCookieDialog} />
             <DropdownMenuSeparator />
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
@@ -2392,6 +2418,16 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
       </div>
       </div>
       {nativeOpen ? nativeSurface : showBrowserView ? browserView : null}
+      {/* One import dialog for the whole panel — a fixed overlay, so it shows
+          over either header. Both triggers (the toolbar menu item and the
+          overlay header button) set the same `cookieDialogOpen`. */}
+      <CookieDialog
+        cookies={cookies}
+        viewRunning={viewRunning}
+        open={cookieDialogOpen}
+        onClose={() => setCookieDialogOpen(false)}
+        onImported={(reachedNewSessionsOnly) => setCookieNewSessionHint(reachedNewSessionsOnly)}
+      />
     </div>
   )
 }
