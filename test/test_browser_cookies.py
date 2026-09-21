@@ -1,11 +1,15 @@
 """Backend tests for the imported-cookies feature.
 
-Covers the three parser shapes and their normalisation, expiry dropping and the
-size/count limits, the owner-only 0600 storageState write, the conditional
-``storageState`` key in the launch config, the value-free summary, the
-best-effort hot-load's failure handling, and the three HTTP handlers (status,
-import, clear) through the aiohttp client fixture including the non-owner 403 and
-the restricted-session 403.
+Covers the three parser shapes and their normalisation (including the strict
+``secure``/``httpOnly`` boolean parsing), expiry dropping and the size/count
+limits, the owner-only 0600 storageState write, the engine-only launch config,
+the value-free summary, the socket-shaped live-session enumeration, the
+``cookie-set`` argv the gateway sends over a daemon socket, the best-effort
+injection and clear and their value-free failure reporting, the
+``SessionWatcher`` (new sockets, re-import, reset, bounds, thread lifecycle),
+and the three HTTP handlers (status, import, clear) through the aiohttp client
+fixture including the non-owner 403, the restricted-session 403, and the shared
+lock that serialises an overlapping import and clear.
 
 No real ``playwright-cli`` is ever spawned: ``cli_command``/``cli_env`` and
 ``subprocess.run`` are faked at the module boundary.
@@ -13,9 +17,11 @@ No real ``playwright-cli`` is ever spawned: ``cli_command``/``cli_env`` and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,7 +40,13 @@ from kiro_crew.platform_compat import IS_WINDOWS
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     h = tmp_path / "home"
     monkeypatch.setenv("KIROCREW_HOME", str(h))
-    return h
+    # The module-level watcher is shared across tests; start each from a clean
+    # record and never leave a thread running.
+    mod._WATCHER.stop()
+    mod._WATCHER.reset()
+    yield h
+    mod._WATCHER.stop()
+    mod._WATCHER.reset()
 
 
 # ── parse_cookie_import: the three shapes ──
@@ -111,6 +123,61 @@ class TestNormalisation:
     def test_missing_expiry_is_session_cookie(self, home: Path) -> None:
         text = json.dumps([{"name": "n", "domain": "d.com"}])
         assert mod.parse_cookie_import(text)[0]["expires"] == -1.0
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            (True, True),
+            (False, False),
+            (None, False),
+            ("true", True),
+            ("TRUE", True),
+            (" True ", True),
+            ("1", True),
+            ("false", False),
+            ("False", False),
+            ("0", False),
+        ],
+    )
+    def test_boolean_flags_accept_booleans_and_their_string_spellings(
+        self, home: Path, raw: object, expected: bool
+    ) -> None:
+        # Cookie-Editor sometimes exports "secure": "true" as a STRING; bool("false")
+        # would be True, so the strings are parsed, not coerced.
+        text = json.dumps([{"name": "n", "domain": "d.com", "secure": raw, "httpOnly": raw}])
+        cookie = mod.parse_cookie_import(text)[0]
+        assert cookie["secure"] is expected
+        assert cookie["httpOnly"] is expected
+
+    @pytest.mark.parametrize("raw", ["yes", "no", "", "2", 1, 0, 1.5, [], {}])
+    @pytest.mark.parametrize("field", ["secure", "httpOnly"])
+    def test_other_boolean_spellings_are_rejected(
+        self, home: Path, raw: object, field: str
+    ) -> None:
+        text = json.dumps([{"name": "n", "domain": "d.com", field: raw}])
+        with pytest.raises(mod.CookieImportError, match=f"invalid {field} value"):
+            mod.parse_cookie_import(text)
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity", "NaN"])
+    def test_non_finite_expiry_string_is_session_cookie(self, home: Path, raw: str) -> None:
+        # A non-finite float would be written verbatim into the storage state and
+        # make it unreadable to the daemon's strict JSON parser.
+        text = json.dumps([{"name": "n", "domain": "d.com", "expirationDate": raw}])
+        assert mod.parse_cookie_import(text)[0]["expires"] == -1.0
+
+    @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+    def test_json_constants_are_rejected(self, home: Path, constant: str) -> None:
+        text = f'[{{"name": "n", "domain": "d.com", "expirationDate": {constant}}}]'
+        with pytest.raises(mod.CookieImportError, match="invalid JSON constant"):
+            mod.parse_cookie_import(text)
+
+    def test_deeply_nested_json_is_a_user_error(self, home: Path) -> None:
+        # json.loads recurses per nesting level; the handler must see a
+        # CookieImportError (400), never a RecursionError (500).
+        depth = 100_000
+        text = "[" * depth + "]" * depth
+        with pytest.raises(mod.CookieImportError, match="nested too deeply|not valid JSON"):
+            mod.parse_cookie_import(text)
 
     def test_expired_cookie_dropped(self, home: Path) -> None:
         past = time.time() - 3600
@@ -213,87 +280,103 @@ class TestSaveAndSummary:
         assert mod.clear_storage_state() is False
 
 
-# ── launch.desired_config conditional storageState key ──
+# ── One config: the agent's launch config never names the masked file ──
 
 
 class TestLaunchConfig:
-    def test_no_key_without_file(self, home: Path) -> None:
+    def test_agent_config_is_engine_only_without_file(self, home: Path) -> None:
         assert launch_mod.desired_config() == {"browser": {"browserName": "chromium"}}
 
-    def test_key_present_with_file(self, home: Path) -> None:
+    def test_agent_config_never_names_the_state_even_when_present(self, home: Path) -> None:
+        """The agent's daemon runs inside the sandbox that masks the file: naming it
+        there would make every browse fail on ENOENT, so the key must never appear."""
         mod.save_storage_state(
             mod.parse_cookie_import(json.dumps([{"name": "n", "domain": "d.com"}]))
         )
-        config = launch_mod.desired_config()
-        browser = config["browser"]
-        assert isinstance(browser, dict)
-        assert browser["contextOptions"] == {"storageState": str(mod.storage_state_path())}
-
-    def test_write_config_converges_after_save_and_clear(self, home: Path) -> None:
-        mod.save_storage_state(
-            mod.parse_cookie_import(json.dumps([{"name": "n", "domain": "d.com"}]))
-        )
+        assert launch_mod.desired_config() == {"browser": {"browserName": "chromium"}}
         path = launch_mod.write_config()
         assert path is not None
-        assert "storageState" in path.read_text(encoding="utf-8")
-        mod.clear_storage_state()
-        launch_mod.write_config()
         assert "storageState" not in path.read_text(encoding="utf-8")
 
-
-# ── hot_load: best effort, never raises ──
-
-
-class TestHotLoad:
-    def test_no_cli_returns_note(self, home: Path) -> None:
-        with patch.object(mod, "cli_command", return_value=None):
-            result = mod.hot_load_into_live_sessions(mod.storage_state_path())
-        assert result == {
-            "loaded": [],
-            "failed": {},
-            "note": "playwright-cli is not installed",
-        }
-
-    def test_no_sessions_returns_note(self, home: Path) -> None:
-        with (
-            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
-            patch.object(mod, "_live_session_names", return_value=[]),
+    def test_no_gateway_side_config_or_prewarm_exists(self, home: Path) -> None:
+        """Design A, invariants 1 and 2: the gateway never starts a daemon for an
+        agent session and writes no config naming the hidden file. A revival of
+        either would reopen the sandbox escape the redesign closed."""
+        for name in (
+            "prewarm_session",
+            "_run_prewarm",
+            "gateway_config",
+            "gateway_config_path",
+            "write_gateway_config",
+            "_GATEWAY_CONFIG_FILE",
+            "hot_load_into_live_sessions",
         ):
-            result = mod.hot_load_into_live_sessions(mod.storage_state_path())
-        assert result["loaded"] == []
-        assert result["failed"] == {}
-        assert "note" in result
+            assert not hasattr(mod, name), name
+        mod.save_storage_state(
+            mod.parse_cookie_import(json.dumps([{"name": "n", "domain": "d.com"}]))
+        )
+        leaves = sorted(p.name for p in home.iterdir())
+        assert leaves == [mod.STORAGE_STATE_FILE]
 
-    def test_loads_and_reports_failures(self, home: Path) -> None:
-        path = mod.storage_state_path()
 
-        def fake_run(argv, **kwargs):
-            proc = MagicMock()
-            proc.returncode = 0 if "-s=kc-aaaa1111" in argv else 1
-            proc.stdout = ""
-            proc.stderr = "boom"
-            return proc
+# ── The state file is masked from every agent sandbox ──
 
-        with (
-            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
-            patch.object(mod, "cli_env", return_value={}),
-            patch.object(mod, "_live_session_names", return_value=["kc-aaaa1111", "kc-bbbb2222"]),
-            patch("subprocess.run", side_effect=fake_run),
-        ):
-            result = mod.hot_load_into_live_sessions(path)
-        assert result["loaded"] == ["kc-aaaa1111"]
-        assert "kc-bbbb2222" in result["failed"]
 
-    def test_never_raises_on_subprocess_error(self, home: Path) -> None:
-        with (
-            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
-            patch.object(mod, "cli_env", return_value={}),
-            patch.object(mod, "_live_session_names", return_value=["kc-aaaa1111"]),
-            patch("subprocess.run", side_effect=OSError("nope")),
-        ):
-            result = mod.hot_load_into_live_sessions(mod.storage_state_path())
-        assert result["loaded"] == []
-        assert "kc-aaaa1111" in result["failed"]
+def test_storage_state_leaf_is_hidden_and_tool_gated() -> None:
+    from kiro_crew import sandbox, security
+
+    assert mod.STORAGE_STATE_FILE in sandbox._CREW_HIDDEN_LEAVES
+    assert mod.STORAGE_STATE_FILE in security._CREW_SECRET_LEAVES
+    assert security.is_sensitive_path(f"~/.kiro/crew/{mod.STORAGE_STATE_FILE}") is True
+
+
+# ── Live-session enumeration by lifecycle-root shape ──
+
+
+def _fake_socket(home: Path, leaf: str, name: str = "0123456789abcdef") -> Path:
+    cli = home / "pw" / leaf / "s" / "cli"
+    cli.mkdir(parents=True, exist_ok=True)
+    sock = cli / f"{name}.sock"
+    sock.write_bytes(b"")
+    return sock
+
+
+def _key(sock: Path) -> mod.SocketKey:
+    st = sock.stat()
+    return (str(sock), st.st_ino, st.st_ctime_ns)
+
+
+class TestLiveSessions:
+    def test_sockets_under_generated_roots_are_sessions(self, home: Path) -> None:
+        a = _fake_socket(home, "aaaa1111")
+        b = _fake_socket(home, "bbbb2222")
+        (home / "pw" / "cccc3333" / "s" / "cli").mkdir(parents=True)  # no socket
+        (home / "pw" / "ui" / "s" / "cli").mkdir(parents=True)  # the gateway's own root
+        (home / "pw" / "ui" / "s" / "cli" / "x-panel.sock").write_bytes(b"")
+        sockets = mod._live_sockets()
+        assert sockets == {"kc-aaaa1111": _key(a), "kc-bbbb2222": _key(b)}
+        sessions = mod._live_sessions()
+        assert sorted(sessions) == ["kc-aaaa1111", "kc-bbbb2222"]
+        env = sessions["kc-aaaa1111"]
+        assert env[launch_mod.SESSION_ENV] == "kc-aaaa1111"
+        assert env[launch_mod.SOCKETS_ENV] == str(home / "pw" / "aaaa1111" / "s")
+        assert env[launch_mod.DAEMON_DIR_ENV] == str(home / "pw" / "aaaa1111" / "d")
+
+    def test_socket_key_is_path_inode_and_ctime(self, home: Path) -> None:
+        """A daemon restart makes a NEW socket file; the key must change with it
+        so the watcher injects into the new daemon rather than trusting the path."""
+        sock = _fake_socket(home, "aaaa1111")
+        first = mod._live_sockets()["kc-aaaa1111"]
+        sock.unlink()
+        time.sleep(0.01)
+        _fake_socket(home, "aaaa1111")
+        second = mod._live_sockets()["kc-aaaa1111"]
+        assert first[0] == second[0]
+        assert first != second
+
+    def test_falls_back_to_list_when_no_root_holds_a_socket(self, home: Path) -> None:
+        with patch.object(mod, "_live_session_names", return_value=["kc-dddd4444"]):
+            assert mod._live_sessions() == {"kc-dddd4444": {}}
 
     def test_live_session_names_filters_to_prefix(self, home: Path) -> None:
         proc = MagicMock()
@@ -305,6 +388,421 @@ class TestHotLoad:
             patch("subprocess.run", return_value=proc),
         ):
             assert mod._live_session_names() == ["kc-aaaa1111", "kc-bbbb2222"]
+
+
+# ── cookie-set argv: what actually crosses the daemon socket ──
+
+
+class TestCookieSetArgv:
+    def test_full_cookie(self) -> None:
+        cookie = {
+            "name": "sid",
+            "value": "-abc=def",
+            "domain": ".example.com",
+            "path": "/",
+            "expires": 1900000000.0,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Strict",
+        }
+        # Verified against the bundled CLI: boolean options are bare flags, the
+        # expiry is a number, and ``--`` ends option parsing so a value that
+        # starts with ``-`` is still a positional.
+        assert mod._cookie_set_argv(cookie) == [
+            "cookie-set",
+            "--domain",
+            ".example.com",
+            "--path",
+            "/",
+            "--sameSite",
+            "Strict",
+            "--expires",
+            "1900000000",
+            "--httpOnly",
+            "--secure",
+            "--",
+            "sid",
+            "-abc=def",
+        ]
+
+    def test_session_cookie_omits_expires_and_flags(self) -> None:
+        cookie = {"name": "n", "value": "v", "domain": "d.com", "path": "/x", "expires": -1.0}
+        argv = mod._cookie_set_argv(cookie)
+        assert "--expires" not in argv
+        assert "--httpOnly" not in argv and "--secure" not in argv
+        assert argv[-3:] == ["--", "n", "v"]
+        assert argv[argv.index("--sameSite") + 1] == "Lax"
+
+    def test_fractional_expiry_is_kept(self) -> None:
+        cookie = {"name": "n", "value": "v", "domain": "d.com", "expires": 1900000000.5}
+        argv = mod._cookie_set_argv(cookie)
+        assert argv[argv.index("--expires") + 1] == "1900000000.5"
+
+
+# ── injection over the daemon socket: best effort, value-free, never raise ──
+
+
+def _import_cookies(home: Path, *names: str) -> list[dict]:
+    text = json.dumps(
+        [{"name": n, "value": f"secret-{n}", "domain": "d.com", "secure": True} for n in names]
+    )
+    cookies = mod.parse_cookie_import(text)
+    mod.save_storage_state(cookies)
+    return cookies
+
+
+class _FakeCli:
+    """Records every ``playwright-cli`` client call; fails the sessions named."""
+
+    def __init__(self, failing: set[str] | None = None, error: str = "boom") -> None:
+        self.failing = failing or set()
+        self.error = error
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), dict(kwargs["env"])))
+        name = next(a for a in argv if a.startswith("-s=")).removeprefix("-s=")
+        proc = MagicMock()
+        proc.returncode = 1 if name in self.failing else 0
+        proc.stdout = f"addCookies([{{value: {argv[-1]}}}])"  # the daemon echoes the value
+        proc.stderr = self.error
+        return proc
+
+    def session_calls(self, name: str) -> list[list[str]]:
+        return [argv for argv, _ in self.calls if f"-s={name}" in argv]
+
+
+class TestInjectIntoLiveSessions:
+    def test_no_cli_returns_note(self, home: Path) -> None:
+        with patch.object(mod, "cli_command", return_value=None):
+            result = mod.inject_into_live_sessions()
+        assert result == {"loaded": [], "failed": {}, "note": "playwright-cli is not installed"}
+
+    def test_no_file_and_no_sessions_return_notes(self, home: Path) -> None:
+        with patch.object(mod, "cli_command", return_value=["node", "cli.js"]):
+            assert "no imported cookies" in mod.inject_into_live_sessions()["note"]
+            _import_cookies(home, "a")
+            with patch.object(mod, "_live_sessions", return_value={}):
+                result = mod.inject_into_live_sessions()
+        assert result["loaded"] == [] and result["failed"] == {}
+        assert "new sessions" in result["note"]
+
+    def test_one_cookie_set_per_cookie_per_session_with_its_env(self, home: Path) -> None:
+        _import_cookies(home, "a", "b")
+        fake = _FakeCli(failing={"kc-bbbb2222"})
+        sessions = {
+            "kc-aaaa1111": {launch_mod.SOCKETS_ENV: "/s/a"},
+            "kc-bbbb2222": {launch_mod.SOCKETS_ENV: "/s/b"},
+        }
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={"PATH": "/bin"}),
+            patch.object(mod, "_live_sessions", return_value=sessions),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            result = mod.inject_into_live_sessions()
+        assert result["loaded"] == ["kc-aaaa1111"]
+        assert result["failed"] == {"kc-bbbb2222": "exit status 1"}
+        assert "note" not in result
+        a_calls = fake.session_calls("kc-aaaa1111")
+        assert len(a_calls) == 2
+        for argv in a_calls:
+            assert argv[:3] == ["node", "cli.js", "-s=kc-aaaa1111"]
+            assert argv[3] == "cookie-set"
+            assert "--secure" in argv
+            assert argv[-3] == "--"
+        assert {argv[-2] for argv in a_calls} == {"a", "b"}
+        assert {argv[-1] for argv in a_calls} == {"secret-a", "secret-b"}
+        env_a = next(env for argv, env in fake.calls if "-s=kc-aaaa1111" in argv)
+        assert env_a == {"PATH": "/bin", launch_mod.SOCKETS_ENV: "/s/a"}
+        # The failing session stopped at its FIRST cookie: a dead socket costs one
+        # spawn, not one per cookie.
+        assert len(fake.session_calls("kc-bbbb2222")) == 1
+
+    def test_failure_reasons_never_carry_cli_output(self, home: Path) -> None:
+        """The daemon's reply to cookie-set echoes the cookie; a failure reason
+        that quoted stderr/stdout could put a value in the HTTP response or log."""
+        _import_cookies(home, "a")
+        fake = _FakeCli(failing={"kc-aaaa1111"}, error="Error: cookie secret-a rejected")
+        sessions = {"kc-aaaa1111": {}}
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch.object(mod, "_live_sessions", return_value=sessions),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            result = mod.inject_into_live_sessions()
+        assert result["failed"] == {"kc-aaaa1111": "exit status 1"}
+        assert "secret" not in json.dumps(result)
+        assert "new sessions" in result["note"]
+
+    def test_never_raises_on_subprocess_error_or_timeout(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        import subprocess
+
+        for exc in (OSError("nope"), subprocess.TimeoutExpired(["x"], 1.0)):
+            with (
+                patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+                patch.object(mod, "cli_env", return_value={}),
+                patch.object(mod, "_live_sessions", return_value={"kc-aaaa1111": {}}),
+                patch("subprocess.run", side_effect=exc),
+            ):
+                result = mod.inject_into_live_sessions()
+            assert result["loaded"] == []
+            reason = result["failed"]["kc-aaaa1111"]
+            assert reason in {"OSError", "cookie-set timed out"} or "timed out" in reason
+
+    def test_records_reached_sockets_with_the_watcher(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        sock = _fake_socket(home, "aaaa1111")
+        fake = _FakeCli()
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            assert mod.inject_into_live_sessions()["loaded"] == ["kc-aaaa1111"]
+            assert mod._WATCHER.injected() == {_key(sock)}
+            # The watcher's next tick has nothing left to do for that socket.
+            before = len(fake.calls)
+            mod._WATCHER.tick()
+            assert len(fake.calls) == before
+
+
+class TestClearLiveSessions:
+    def test_no_cli_and_no_sessions_carry_notes(self, home: Path) -> None:
+        with patch.object(mod, "cli_command", return_value=None):
+            assert mod.clear_live_sessions()["note"] == "playwright-cli is not installed"
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "_live_sessions", return_value={}),
+        ):
+            result = mod.clear_live_sessions()
+        assert result["cleared"] == [] and result["failed"] == {} and "note" in result
+
+    def test_runs_cookie_clear_per_session_and_reports(self, home: Path) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            proc = MagicMock()
+            proc.returncode = 0 if "-s=kc-aaaa1111" in argv else 1
+            proc.stdout = ""
+            proc.stderr = "The browser 'kc-bbbb2222' is not open"
+            return proc
+
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch.object(
+                mod, "_live_sessions", return_value={"kc-aaaa1111": {}, "kc-bbbb2222": {}}
+            ),
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            result = mod.clear_live_sessions()
+        assert result == {
+            "cleared": ["kc-aaaa1111"],
+            "failed": {"kc-bbbb2222": "The browser 'kc-bbbb2222' is not open"},
+        }
+        assert all(argv[-1] == "cookie-clear" for argv in calls)
+
+    def test_resets_the_watcher_record(self, home: Path) -> None:
+        mod._WATCHER.mark_injected(("/x.sock", 1, 2))
+        with patch.object(mod, "cli_command", return_value=None):
+            mod.clear_live_sessions()
+        assert mod._WATCHER.injected() == frozenset()
+
+    def test_never_raises(self, home: Path) -> None:
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch.object(mod, "_live_sessions", return_value={"kc-aaaa1111": {}}),
+            patch("subprocess.run", side_effect=OSError("nope")),
+        ):
+            assert "kc-aaaa1111" in mod.clear_live_sessions()["failed"]
+
+
+# ── SessionWatcher: cookies for daemons that appear after the import ──
+
+
+class TestSessionWatcher:
+    def test_no_file_means_no_work_and_a_clean_record(self, home: Path) -> None:
+        watcher = mod.SessionWatcher()
+        watcher.mark_injected(("/x.sock", 1, 2))
+        _fake_socket(home, "aaaa1111")
+        with patch.object(mod, "cli_command", return_value=["node", "cli.js"]) as cli:
+            assert watcher.tick() == 0
+        cli.assert_not_called()
+        assert watcher.injected() == frozenset()
+
+    def test_injects_new_sockets_once_and_skips_them_afterwards(self, home: Path) -> None:
+        _import_cookies(home, "a", "b")
+        a = _fake_socket(home, "aaaa1111")
+        watcher = mod.SessionWatcher()
+        fake = _FakeCli()
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={"PATH": "/bin"}),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            assert watcher.tick() == 1
+            assert len(fake.session_calls("kc-aaaa1111")) == 2  # one cookie-set per cookie
+            env = fake.calls[0][1]
+            assert env[launch_mod.SESSION_ENV] == "kc-aaaa1111"
+            assert env[launch_mod.SOCKETS_ENV] == str(home / "pw" / "aaaa1111" / "s")
+            assert env[launch_mod.DAEMON_DIR_ENV] == str(home / "pw" / "aaaa1111" / "d")
+            assert watcher.injected() == {_key(a)}
+            assert watcher.tick() == 0
+            assert len(fake.calls) == 2
+            # A second session appears: only it is injected.
+            b = _fake_socket(home, "bbbb2222")
+            assert watcher.tick() == 1
+            assert len(fake.session_calls("kc-bbbb2222")) == 2
+            assert len(fake.session_calls("kc-aaaa1111")) == 2
+            assert watcher.injected() == {_key(a), _key(b)}
+
+    def test_a_new_daemon_socket_for_the_same_session_is_injected_again(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        sock = _fake_socket(home, "aaaa1111")
+        watcher = mod.SessionWatcher()
+        fake = _FakeCli()
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            assert watcher.tick() == 1
+            sock.unlink()
+            time.sleep(0.01)
+            _fake_socket(home, "aaaa1111", name="fedcba9876543210")
+            assert watcher.tick() == 1
+        assert len(fake.calls) == 2
+
+    def test_reimport_changes_the_file_and_reinjects_everything(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        _fake_socket(home, "aaaa1111")
+        watcher = mod.SessionWatcher()
+        fake = _FakeCli()
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            assert watcher.tick() == 1
+            assert watcher.tick() == 0
+            time.sleep(0.01)
+            _import_cookies(home, "a", "b", "c")  # new mtime and size
+            assert watcher.tick() == 1
+        assert len(fake.calls) == 1 + 3
+
+    def test_reset_forgets_the_record(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        _fake_socket(home, "aaaa1111")
+        watcher = mod.SessionWatcher()
+        fake = _FakeCli()
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            assert watcher.tick() == 1
+            watcher.reset()
+            assert watcher.injected() == frozenset()
+            assert watcher.tick() == 1
+        assert len(fake.calls) == 2
+
+    def test_failed_sockets_are_retried_a_bounded_number_of_times(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        _fake_socket(home, "aaaa1111")
+        watcher = mod.SessionWatcher()
+        fake = _FakeCli(failing={"kc-aaaa1111"})
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            for _ in range(mod.WATCH_MAX_ATTEMPTS + 3):
+                assert watcher.tick() == 0
+        assert len(fake.calls) == mod.WATCH_MAX_ATTEMPTS
+        assert watcher.injected() == frozenset()
+
+    def test_a_tick_is_bounded_to_a_few_sessions(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        leaves = [f"{i:08x}" for i in range(mod.WATCH_MAX_SESSIONS_PER_TICK + 3)]
+        for leaf in leaves:
+            _fake_socket(home, leaf)
+        watcher = mod.SessionWatcher()
+        fake = _FakeCli()
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=fake),
+        ):
+            assert watcher.tick() == mod.WATCH_MAX_SESSIONS_PER_TICK
+            assert watcher.tick() == 3
+            assert watcher.tick() == 0
+        assert len(watcher.injected()) == len(leaves)
+
+    def test_gone_sockets_leave_the_record(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        sock = _fake_socket(home, "aaaa1111")
+        watcher = mod.SessionWatcher()
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=_FakeCli()),
+        ):
+            watcher.tick()
+            assert watcher.injected() == {_key(sock)}
+            sock.unlink()
+            _fake_socket(home, "bbbb2222")
+            watcher.tick()
+        assert all(
+            key[0].endswith("bbbb2222/s/cli/0123456789abcdef.sock") for key in watcher.injected()
+        )
+
+    def test_a_tick_never_raises(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        _fake_socket(home, "aaaa1111")
+        watcher = mod.SessionWatcher()
+        with patch.object(mod, "_live_sockets", side_effect=RuntimeError("boom")):
+            assert watcher.tick() == 0
+
+    def test_thread_lifecycle_is_idempotent_and_off_the_loop(self, home: Path) -> None:
+        _import_cookies(home, "a")
+        _fake_socket(home, "aaaa1111")
+        ticked = threading.Event()
+        watcher = mod.SessionWatcher(interval=0.01)
+        fake = _FakeCli()
+
+        def run(argv, **kwargs):
+            ticked.set()
+            return fake(argv, **kwargs)
+
+        with (
+            patch.object(mod, "cli_command", return_value=["node", "cli.js"]),
+            patch.object(mod, "cli_env", return_value={}),
+            patch("subprocess.run", side_effect=run),
+        ):
+            watcher.start()
+            first = watcher._thread
+            watcher.start()  # idempotent
+            assert watcher._thread is first
+            assert watcher.running
+            assert first is not None and first.daemon is True
+            assert first.name == "browser-cookie-watcher"
+            assert ticked.wait(5)
+            watcher.stop()
+            watcher.stop()  # idempotent
+            assert not watcher.running
+        assert len(fake.calls) == 1
+
+    def test_module_singleton_start_stop(self, home: Path) -> None:
+        mod.start_session_watcher()
+        assert mod._WATCHER.running
+        mod.stop_session_watcher()
+        assert not mod._WATCHER.running
+        mod.stop_session_watcher()
 
 
 # ── HTTP handlers ──
@@ -364,7 +862,7 @@ async def test_status_absent_then_present(app, home: Path) -> None:
         assert body["config_path"].endswith("browser-storage-state.json")
 
         with patch(
-            "kiro_crew.browser_cli.cookies.hot_load_into_live_sessions",
+            "kiro_crew.browser_cli.cookies.inject_into_live_sessions",
             return_value={"loaded": [], "failed": {}},
         ):
             imp = await client.post(
@@ -411,10 +909,86 @@ async def test_import_oversize_is_413(app, home: Path) -> None:
 @pytest.mark.asyncio
 async def test_clear_removes(app, home: Path) -> None:
     mod.save_storage_state(mod.parse_cookie_import(json.dumps([{"name": "n", "domain": "d.com"}])))
+    live = {"cleared": ["kc-aaaa1111"], "failed": {"kc-bbbb2222": "not open"}}
     async with TestClient(TestServer(app)) as client:
-        resp = await client.delete("/api/browser/cookies")
+        with patch(
+            "kiro_crew.browser_cli.cookies.clear_live_sessions", return_value=live
+        ) as clear_live:
+            resp = await client.delete("/api/browser/cookies")
         assert resp.status == 200
-        assert (await resp.json()) == {"ok": True, "present": False}
+        # Live sessions are cleared too, and the outcome is reported, not hidden.
+        assert (await resp.json()) == {"ok": True, "present": False, "live": live}
+        clear_live.assert_called_once_with()
+    assert not mod.storage_state_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_import_injects_live_sessions_and_reports_the_note(app, home: Path) -> None:
+    hot = {"loaded": [], "failed": {"kc-aaaa1111": "exit status 1"}, "note": "nothing reached"}
+    async with TestClient(TestServer(app)) as client:
+        with patch(
+            "kiro_crew.browser_cli.cookies.inject_into_live_sessions", return_value=hot
+        ) as inject:
+            resp = await client.post(
+                "/api/browser/cookies",
+                json={"content": json.dumps([{"name": "n", "value": "v", "domain": "d.com"}])},
+            )
+        assert resp.status == 200
+        assert (await resp.json())["hot_load"] == hot
+        # Injection runs AFTER the file is written, from the stored state.
+        inject.assert_called_once_with()
+    assert mod.storage_state_path().exists()
+    # Nothing but the state file appears under the data home: no config the
+    # agent or its daemon reads ever names it.
+    agent = launch_mod.launch_config_path()
+    assert not agent.exists() or "storageState" not in agent.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_import_and_clear_are_serialised_by_one_lock(app, home: Path) -> None:
+    """An overlapping POST and DELETE must not interleave at the to_thread
+    boundary: with the lock, the DELETE's delete+clear runs only after the POST's
+    save+inject has finished (or the reverse), so a cleared state can never be
+    left active in the live sessions."""
+    events: list[str] = []
+    import_started = threading.Event()
+    release_import = threading.Event()
+
+    def slow_inject():
+        events.append("import:inject:start")
+        import_started.set()
+        assert release_import.wait(5)
+        events.append("import:inject:end")
+        return {"loaded": [], "failed": {}}
+
+    def clear_live():
+        events.append("clear:live")
+        return {"cleared": [], "failed": {}}
+
+    async with TestClient(TestServer(app)) as client:
+        with (
+            patch(
+                "kiro_crew.browser_cli.cookies.inject_into_live_sessions", side_effect=slow_inject
+            ),
+            patch("kiro_crew.browser_cli.cookies.clear_live_sessions", side_effect=clear_live),
+        ):
+            post = asyncio.ensure_future(
+                client.post(
+                    "/api/browser/cookies",
+                    json={"content": json.dumps([{"name": "n", "value": "v", "domain": "d.com"}])},
+                )
+            )
+            # Wait until the import is inside its transaction, then fire the clear.
+            await asyncio.get_running_loop().run_in_executor(None, import_started.wait, 5)
+            delete = asyncio.ensure_future(client.delete("/api/browser/cookies"))
+            await asyncio.sleep(0.2)
+            # The clear has NOT run: the import still holds the lock.
+            assert events == ["import:inject:start"]
+            assert mod.storage_state_path().exists()
+            release_import.set()
+            post_resp, delete_resp = await asyncio.gather(post, delete)
+    assert post_resp.status == 200 and delete_resp.status == 200
+    assert events == ["import:inject:start", "import:inject:end", "clear:live"]
     assert not mod.storage_state_path().exists()
 
 
@@ -434,12 +1008,18 @@ async def test_restricted_session_forbidden(home: Path, mock_sel) -> None:
     from kiro_crew.dashboard.handlers import messaging
 
     application = web.Application()
+    application.router.add_get("/api/browser/cookies", messaging.api_browser_cookies_get)
     application.router.add_post("/api/browser/cookies", messaging.api_browser_cookies_import)
     application.router.add_delete("/api/browser/cookies", messaging.api_browser_cookies_clear)
     as_owner(application)
     application["state"] = _make_state(restricted=True)
     headers = {"X-Session-Key": "dashboard:guest"}
     async with TestClient(TestServer(application)) as client:
+        # The status read names the sites a credential unlocks, so it is refused
+        # on the SAME body shape as the mutations (the panel hides on one code).
+        status = await client.get("/api/browser/cookies", headers=headers)
+        assert status.status == 403
+        assert (await status.json())["code"] == "restricted_session"
         imp = await client.post(
             "/api/browser/cookies",
             json={"content": json.dumps([{"name": "n", "domain": "d.com"}])},

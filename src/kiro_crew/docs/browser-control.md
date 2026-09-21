@@ -51,11 +51,15 @@ logged-in session reaches a gateway running on a different machine from your
 laptop.
 
 The cookie values stay on the gateway host and are never shown back to you, and
-the agent never reads the stored file — it only gets the cookies through the
-browser sessions the gateway starts for it. Imported cookies apply to **new**
-browser sessions automatically; a session already open picks them up on a
-best-effort basis, and if it does not, the next one will. Clear them at any time
-from the same control.
+the agent never reads the stored file — the gateway hands the cookies to the
+agent's browser over that browser's own control socket, one `cookie-set` per
+cookie, so the browser receives them as data and opens no file. A session that
+is already open receives them at import time (best effort; the panel reports any
+session that could not be reached). A session the agent opens later receives them
+within about two seconds of its browser starting, so the very first page load of
+a brand-new session can arrive before its cookies do; the next one has them.
+Clear them at any time from the same control: the stored file is removed and
+every open session's cookies are cleared too.
 
 ## Related docs
 

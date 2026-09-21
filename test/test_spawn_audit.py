@@ -1034,17 +1034,35 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # runs them as ordinary shell tool calls through the standard approval
         # path.
         #   * ``cookies.py::_live_session_names`` runs ``playwright-cli list``
-        #     (fixed argv, no free element) and
-        #     ``cookies.py::hot_load_into_live_sessions`` runs
-        #     ``-s=kc-<8hex> state-load <path>`` once per live Kiro Crew session,
-        #     right after the dashboard OWNER imported cookies. The session names
-        #     come from ``list`` filtered to the reserved ``kc-`` prefix and the
-        #     path is Kiro Crew's own storage-state file under the data home, so
-        #     no request input reaches argv. The route is owner-only and refuses
-        #     internal-secret (agent) callers, same as ``launcher.py::_run_cli``;
-        #     not sandboxed for the same reason ``show`` is not.
+        #     (fixed argv, no free element);
+        #     ``cookies.py::_run_on_sessions`` runs ``-s=kc-<8hex> cookie-clear``
+        #     once per live Kiro Crew session right after the dashboard OWNER
+        #     cleared cookies. The session names come from the
+        #     ``kc-<8hex>``-shaped lifecycle roots under the data home (or
+        #     ``list`` filtered to the reserved prefix), so no request input
+        #     reaches argv. The routes are owner-only and refuse internal-secret
+        #     (agent) callers, same as ``launcher.py::_run_cli``; not sandboxed
+        #     for the same reason ``show`` is not.
+        #   * ``cookies.py::_run_cli`` runs ``-s=kc-<8hex> cookie-set --domain D
+        #     --path P [--expires N] --sameSite S [--httpOnly] [--secure] -- <name>
+        #     <value>`` once per stored cookie per live session: from the import
+        #     handler (``inject_into_live_sessions``) and from the gateway's
+        #     ``SessionWatcher`` thread when a new agent daemon socket appears.
+        #     This is the ONLY way imported cookies reach an agent's browser: the
+        #     daemon runs inside the agent's sandbox where the state file is
+        #     masked, so the gateway hands the cookies to it over its control
+        #     socket as DATA and the daemon opens no file. The cookie fields come
+        #     from Kiro Crew's own 0600 state file (normalised at import, never
+        #     raw request text), options precede ``--`` so a value cannot be read
+        #     as an option, and stdout/stderr never reach a result or a log line
+        #     because the daemon's reply echoes the value. Not sandboxed: it is a
+        #     CLI client connecting to a socket, not a browser. Never a daemon
+        #     START for an agent session -- a gateway-privileged daemon under
+        #     agent control would be a sandbox escape (the round-2 pre-warm this
+        #     replaces).
         "browser_cli/cookies.py::_live_session_names",
-        "browser_cli/cookies.py::hot_load_into_live_sessions",
+        "browser_cli/cookies.py::_run_cli",
+        "browser_cli/cookies.py::_run_on_sessions",
         "browser_cli/install.py::_run",
         "browser_cli/launcher.py::_run_cli",
         "browser_cli/view.py::_spawn",

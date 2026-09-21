@@ -3,11 +3,42 @@ to the agent's ``playwright-cli`` sessions.
 
 The dashboard user exports cookies from the browser where they are already
 logged in and imports them here; the gateway normalises them to Playwright's
-cookie shape, writes one owner-only ``storageState`` file under the data home,
-and :mod:`kiro_crew.browser_cli.launch` names that file in the launch config so
-every NEW ``playwright-cli`` session starts with the cookies loaded. This is the
-remote-gateway path a hand-written ``PLAYWRIGHT_MCP_CONFIG`` otherwise has to
-carry by hand.
+cookie shape and writes one owner-only ``storageState`` file under the data
+home. That file is **bind-masked out of every agent sandbox**
+(``sandbox._CREW_HIDDEN_LEAVES``): the agent must never be able to read a
+session cookie off disk, and a spawned shell's ``open()`` never routes through
+the tool gate, so only the OS mask holds. The cookies still have to reach the
+agent's browser. Three invariants decide how:
+
+1. **The agent's browser daemon always runs inside the agent's sandbox**,
+   started by the agent's own command exactly as before this feature. The
+   gateway never starts a daemon for an agent session: a gateway-privileged
+   daemon driven by the agent (``upload <masked path>``, ``state-save``) would
+   be a sandbox escape.
+2. **No config the agent or its daemon reads names the hidden file.** The
+   launch config (:func:`kiro_crew.browser_cli.launch.desired_config`) stays
+   engine-only; there is no second, gateway-side config.
+3. **Cookies reach a daemon only through its control socket, as data.** The
+   gateway runs the CLI client ``playwright-cli -s=<kc-name> cookie-set ...``
+   once per cookie with that session's socket/registry directories
+   (:func:`_session_env`), and the daemon does ``context.addCookies``. It opens
+   no file. Two entry points: the import handler injects into every live
+   ``kc-*`` session at once (:func:`inject_into_live_sessions`), and a
+   gateway-side :class:`SessionWatcher` thread injects into every daemon
+   socket that appears afterwards, so a session the agent starts later carries
+   the cookies too. The clear handler runs ``cookie-clear`` on the live
+   sessions (:func:`clear_live_sessions`) and resets the watcher's record.
+
+**Residuals, stated plainly.** (i) The watcher polls every
+:data:`WATCH_INTERVAL_S` seconds, so the very first navigation of a brand-new
+session can run before its cookies land (at most one interval late; the next
+navigation has them). (ii) Each ``cookie-set`` carries the cookie's name and
+value in the CLI client's argv, visible for the milliseconds that process lives
+to same-UID processes reading ``/proc`` -- the alternative, a file the daemon
+opens, is exactly what invariant 2 forbids, and the daemon's socket protocol
+offers no stdin path for a cookie. The daemon's reply echoes the value too,
+which is why an injection failure is reported by return code alone and never by
+its output.
 
 **Three import shapes are accepted**, because that is what the browsers and
 their export extensions actually produce:
@@ -31,26 +62,45 @@ with a message meant to be shown to the user.
 **Values never leave.** :func:`storage_state_summary` reports counts, domains
 and the earliest expiry, and nothing here ever returns or logs a cookie value.
 The agent is told (see ``docs/browser-control.md``) that imported cookies apply
-to new sessions on their own and that it must never read the storage-state file.
+to new sessions on their own and that it must never read the storage-state file
+-- and the sandbox mask is what makes that last sentence a fact rather than an
+instruction.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
+import subprocess
+import threading
 import time
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser_cli.install import cli_command, cli_env
-from kiro_crew.browser_cli.launch import _SESSION_PREFIX
+from kiro_crew.browser_cli.launch import (
+    _LIFECYCLE_DIR,
+    _SESSION_PREFIX,
+    DAEMON_DIR_ENV,
+    SESSION_ENV,
+    SOCKETS_ENV,
+    _session_leaf,
+    daemon_dir,
+    socket_dir,
+)
 from kiro_crew.config.paths import config_dir
 
 logger = logging.getLogger(__name__)
 
-#: The storageState file playwright-cli loads. Fixed name under the data home so
-#: an isolated ``KIROCREW_HOME`` (a pod, a test) stays isolated here too.
+#: The storageState file the gateway reads and injects from. Fixed name under
+#: the data home so an isolated ``KIROCREW_HOME`` (a pod, a test) stays isolated
+#: here too. Listed in ``sandbox._CREW_HIDDEN_LEAVES`` and
+#: ``security._CREW_SECRET_LEAVES`` under exactly this name: renaming it here
+#: without renaming it there would silently put the cookie values back in the
+#: agent's reach. Nothing the agent or its daemon reads ever names this path.
 STORAGE_STATE_FILE = "browser-storage-state.json"
 
 #: Reject an import whose raw text exceeds this, before parsing: the same 2 MiB
@@ -63,8 +113,25 @@ MAX_IMPORT_BYTES = 2 * 1024 * 1024
 #: and bounds the work of writing and re-loading the state.
 MAX_COOKIES = 5000
 
-#: How long a ``state-load`` on one live session is allowed to take.
-_HOT_LOAD_TIMEOUT_S = 15.0
+#: How long one CLI client call against a live session (``cookie-set`` for one
+#: cookie, ``cookie-clear``, ``list``) may take before it is abandoned.
+_CLI_TIMEOUT_S = 15.0
+
+#: How often the :class:`SessionWatcher` looks for new daemon sockets. The
+#: first navigation of a brand-new session can run up to this long before its
+#: cookies land (see the module docstring).
+WATCH_INTERVAL_S = 2.0
+
+#: Upper bound on the sessions one watcher tick injects into, so a burst of new
+#: sessions cannot turn one tick into an unbounded run of CLI spawns; the rest
+#: are picked up on the following ticks.
+WATCH_MAX_SESSIONS_PER_TICK = 4
+
+#: How many ticks the watcher retries a socket whose injection failed before it
+#: stops trying. A socket can appear before its daemon accepts connections, and
+#: a socket can outlive its daemon (the CLI unlinks it on a failed connect, not
+#: on exit); a small budget covers the first and bounds the second.
+WATCH_MAX_ATTEMPTS = 3
 
 #: Playwright's three accepted ``sameSite`` values.
 _SAME_SITE_VALUES = frozenset({"Strict", "Lax", "None"})
@@ -108,6 +175,16 @@ def _normalize_same_site(raw: Any) -> str:
     return "Lax"
 
 
+def _reject_json_constant(name: str) -> Any:
+    """Refuse the non-standard JSON constants ``NaN``/``Infinity``/``-Infinity``.
+
+    ``json.loads`` accepts them by default; a cookie export never legitimately
+    carries one, and letting one through would persist a value the daemon's
+    strict parser cannot read.
+    """
+    raise CookieImportError(f"cookie import contains the invalid JSON constant {name}")
+
+
 def _normalize_expires(raw: Any) -> float:
     """Normalise an expiry to a float unix timestamp, or ``-1`` for a session cookie.
 
@@ -127,9 +204,41 @@ def _normalize_expires(raw: Any) -> float:
             parsed = float(raw)
         except ValueError:
             parsed = None
-    if parsed is None or parsed <= 0:
+    if parsed is None or not math.isfinite(parsed) or parsed <= 0:
+        # NaN/Infinity would be written verbatim and make the persisted state
+        # unreadable to the daemon; they carry no expiry, so: session cookie.
         return -1.0
     return parsed
+
+
+#: The string spellings of a boolean cookie attribute that exports emit.
+#: Cookie-Editor sometimes writes ``"secure": "true"``; Netscape exports carry
+#: ``TRUE``/``FALSE`` (handled by :func:`_parse_netscape` before this point).
+_FLAG_STRINGS = {"true": True, "1": True, "false": False, "0": False}
+
+
+def _normalize_flag(raw: Any, field: str, cookie_name: str) -> bool:
+    """Normalise a ``secure`` / ``httpOnly`` attribute to a real boolean.
+
+    Accepts a JSON boolean, an absent/``null`` value (``False``), and the
+    strings ``"true"``/``"false"``/``"1"``/``"0"`` case-insensitively, which is
+    what the extension exports actually produce. Anything else -- a number, an
+    object, another word -- raises :class:`CookieImportError` rather than being
+    coerced: ``bool("false")`` is ``True``, and silently marking an httpOnly
+    cookie as script-readable (or the reverse) is exactly the kind of quiet
+    corruption an import must refuse.
+    """
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        mapped = _FLAG_STRINGS.get(raw.strip().lower())
+        if mapped is not None:
+            return mapped
+    raise CookieImportError(
+        f"cookie {cookie_name!r} has an invalid {field} value; expected true or false"
+    )
 
 
 def _normalize_cookie(raw: Any) -> dict[str, Any]:
@@ -160,8 +269,8 @@ def _normalize_cookie(raw: Any) -> dict[str, Any]:
         "domain": domain,
         "path": path if isinstance(path, str) and path else "/",
         "expires": expires,
-        "httpOnly": bool(raw.get("httpOnly", False)),
-        "secure": bool(raw.get("secure", False)),
+        "httpOnly": _normalize_flag(raw.get("httpOnly"), "httpOnly", name),
+        "secure": _normalize_flag(raw.get("secure"), "secure", name),
         "sameSite": _normalize_same_site(raw.get("sameSite")),
     }
 
@@ -224,7 +333,11 @@ def parse_cookie_import(text: str) -> list[dict[str, Any]]:
     stripped = text.lstrip()
     if stripped[:1] in "{[":
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(text, parse_constant=_reject_json_constant)
+        except RecursionError as exc:
+            # json.loads recurses per nesting level; a pathological document
+            # must be a 400, not a 500 from the handler.
+            raise CookieImportError("cookie import is nested too deeply") from exc
         except ValueError as exc:
             raise CookieImportError(f"cookie import is not valid JSON: {exc}") from exc
         if isinstance(parsed, dict):
@@ -305,7 +418,7 @@ def storage_state_summary() -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     cookies = data.get("cookies") if isinstance(data, dict) else None
     if not isinstance(cookies, list):
@@ -337,26 +450,44 @@ def storage_state_summary() -> dict[str, Any] | None:
     }
 
 
-def _live_session_names() -> list[str]:
-    """Best-effort list of the live ``kc-*`` playwright-cli sessions.
+# ── Live sessions: the gateway reaching an agent's daemon ────────────────────
 
-    Runs ``playwright-cli list`` and returns the names beginning with the
-    Kiro-Crew session prefix. Never raises: an empty list means "could not
-    enumerate", which the caller reports rather than treating as an error. The
-    output format is a line per session with the name as its first
-    whitespace-separated token; a name is only accepted when it carries the
-    reserved prefix, so a header or a stray line is ignored.
+
+def _session_env(session_name: str) -> dict[str, str]:
+    """The lifecycle variables an agent process was handed for *session_name*.
+
+    Mirrors :func:`kiro_crew.browser_cli.launch.browser_socket_env` for the
+    DEFAULT lifecycle root: the socket and registry directories are derived from
+    the generated name, so a gateway-side CLI client pointed at them connects to
+    the same daemon the agent's commands reach. An operator-configured root
+    (``SOCKETS_ENV`` set to a foreign path before the gateway started) is not
+    re-derived here; sessions under it are simply not enumerated.
+    """
+    return {
+        SESSION_ENV: session_name,
+        SOCKETS_ENV: str(socket_dir(session_name)),
+        DAEMON_DIR_ENV: str(daemon_dir(session_name)),
+    }
+
+
+def _live_session_names() -> list[str]:
+    """Best-effort list of the live ``kc-*`` sessions visible to ``playwright-cli list``.
+
+    Runs ``list`` under the gateway's own environment and returns the names
+    beginning with the Kiro-Crew session prefix. Never raises: an empty list
+    means "could not enumerate". Only sessions registered in the DEFAULT
+    registry show up here -- one an agent started on a host where the lifecycle
+    hooks are unsupported -- which is why :func:`_live_sessions` scans the
+    per-session lifecycle roots first and falls back to this.
     """
     command = cli_command()
     if command is None:
         return []
-    import subprocess  # noqa: PLC0415 - kept local so import-time never spawns
-
     try:
         proc = subprocess.run(
             [*command, "list"],
             capture_output=True,
-            timeout=_HOT_LOAD_TIMEOUT_S,
+            timeout=_CLI_TIMEOUT_S,
             env=cli_env(),
             encoding="utf-8",
             errors="replace",
@@ -373,39 +504,115 @@ def _live_session_names() -> list[str]:
     return names
 
 
-def hot_load_into_live_sessions(path: Path) -> dict[str, Any]:
-    """Load *path* into every live ``kc-*`` session, best effort.
+#: Identity of one daemon control socket: ``(path, inode, ctime_ns)``. A new
+#: daemon for the same session gets a new socket file, so a key that has been
+#: injected into stays injected even when the path is later reused.
+SocketKey = tuple[str, int, int]
 
-    Runs ``playwright-cli -s=<name> state-load <path>`` for each enumerated
-    session, so a browser already open picks up the freshly imported cookies
-    without an agent restart. NEVER raises. Returns ``{"loaded": [names],
-    "failed": {name: reason}}``; when the CLI is unavailable or no session could
-    be enumerated it returns ``{"loaded": [], "failed": {}, "note": "..."}``
-    explaining why. New sessions get the cookies from the launch config
-    regardless, so an empty result is a "nothing to hot-load into", not a
-    failure to import.
+
+def _live_sockets() -> dict[str, SocketKey]:
+    """Live ``kc-*`` sessions found by SHAPE, each with its newest control socket.
+
+    Every generated session gets its own ``<data-home>/pw/<8hex>/{s,d}`` subtree
+    (:func:`kiro_crew.browser_cli.launch.browser_socket_env`), precisely so
+    ``playwright-cli list`` under one root cannot see a peer's browser -- which
+    also means a bare ``list`` from the gateway sees none of them. So the
+    gateway enumerates by shape: a ``pw/<8hex>/s/cli/*.sock`` control socket
+    marks session ``kc-<8hex>`` as a candidate. A socket can outlive its daemon
+    (the CLI unlinks it on a failed connect, not on exit), so "candidate" is
+    the honest word; the command run against it reports the truth. Never
+    raises; an unreadable root is an empty result.
+    """
+    found: dict[str, SocketKey] = {}
+    root = config_dir() / _LIFECYCLE_DIR
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        name = f"{_SESSION_PREFIX}{entry.name}"
+        if not _session_leaf(name):
+            continue
+        newest: tuple[int, SocketKey] | None = None
+        try:
+            for sock in (entry / "s" / "cli").iterdir():
+                if sock.suffix != ".sock":
+                    continue
+                st = sock.stat()
+                key: SocketKey = (str(sock), st.st_ino, st.st_ctime_ns)
+                if newest is None or st.st_ctime_ns > newest[0]:
+                    newest = (st.st_ctime_ns, key)
+        except OSError:
+            continue
+        if newest is not None:
+            found[name] = newest[1]
+    return found
+
+
+def _live_sessions() -> dict[str, dict[str, str]]:
+    """Candidate live ``kc-*`` sessions, each with the env a CLI client needs to reach it.
+
+    The socket-shaped enumeration of :func:`_live_sockets`, falling back to the
+    ``list`` output when no per-session root holds a socket (a host where the
+    lifecycle hooks are unsupported registers sessions in the default registry
+    instead, reachable with no extra environment).
+    """
+    found = {name: _session_env(name) for name in _live_sockets()}
+    if found:
+        return found
+    return {name: {} for name in _live_session_names()}
+
+
+def _run_cli(argv: list[str], env: Mapping[str, str]) -> tuple[bool, str]:
+    """Run one CLI client call; ``(ok, reason)`` with ``reason`` never carrying output.
+
+    The reason names the return code or the exception class only. The daemon's
+    reply to ``cookie-set`` echoes the cookie it was handed, so the CLI's
+    stdout/stderr must not flow into a result the handler returns or a log line.
+    """
+    try:
+        proc = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_CLI_TIMEOUT_S,
+            env=dict(env),
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{argv[-1] if argv else 'cli'} timed out"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, type(exc).__name__
+    if proc.returncode == 0:
+        return True, ""
+    return False, f"exit status {proc.returncode}"
+
+
+def _run_on_sessions(
+    verb: list[str], sessions: Mapping[str, Mapping[str, str]]
+) -> tuple[list[str], dict[str, str]]:
+    """Run ``playwright-cli -s=<name> <verb>`` on each session; ``(succeeded, {name: reason})``.
+
+    Never raises. Each session gets the gateway's CLI environment plus its own
+    lifecycle variables, so the client connects to THAT session's daemon. The
+    verb is value-free (``cookie-clear``), so the daemon's own error text is
+    the reason reported -- it names the session, never a cookie.
     """
     command = cli_command()
     if command is None:
-        return {"loaded": [], "failed": {}, "note": "playwright-cli is not installed"}
-    sessions = _live_session_names()
-    if not sessions:
-        return {
-            "loaded": [],
-            "failed": {},
-            "note": "no live browser sessions; cookies apply to new sessions automatically",
-        }
-    import subprocess  # noqa: PLC0415 - kept local so import-time never spawns
-
-    loaded: list[str] = []
+        return [], {name: "playwright-cli is not installed" for name in sessions}
+    base_env = cli_env()
+    done: list[str] = []
     failed: dict[str, str] = {}
-    env = cli_env()
-    for name in sessions:
+    for name, overrides in sessions.items():
+        env = {**base_env, **overrides}
         try:
             proc = subprocess.run(
-                [*command, f"-s={name}", "state-load", str(path)],
+                [*command, f"-s={name}", *verb],
                 capture_output=True,
-                timeout=_HOT_LOAD_TIMEOUT_S,
+                timeout=_CLI_TIMEOUT_S,
                 env=env,
                 encoding="utf-8",
                 errors="replace",
@@ -414,7 +621,311 @@ def hot_load_into_live_sessions(path: Path) -> dict[str, Any]:
             failed[name] = str(exc)
             continue
         if proc.returncode == 0:
-            loaded.append(name)
+            done.append(name)
         else:
-            failed[name] = (proc.stderr or "state-load failed").strip()[:200]
-    return {"loaded": loaded, "failed": failed}
+            failed[name] = (proc.stderr or proc.stdout or f"{verb[0]} failed").strip()[:200]
+    return done, failed
+
+
+def _cookie_set_argv(cookie: Mapping[str, Any]) -> list[str]:
+    """The ``cookie-set`` verb for one normalised cookie, options first, ``--`` last.
+
+    Verified against the bundled CLI (``cookie-set --help``, and a live run):
+    ``--httpOnly`` / ``--secure`` are bare boolean flags (minimist booleans, so a
+    following token is never consumed as their value); ``--expires`` is a number
+    and is omitted for a session cookie (``-1``), which is what the daemon's
+    tool expects; ``--`` ends option parsing, so a name or value that begins
+    with ``-`` still lands in the positionals.
+    """
+    argv = [
+        "cookie-set",
+        "--domain",
+        str(cookie["domain"]),
+        "--path",
+        str(cookie.get("path") or "/"),
+        "--sameSite",
+        str(cookie.get("sameSite") or "Lax"),
+    ]
+    expires = cookie.get("expires")
+    if isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires > 0:
+        argv += ["--expires", str(int(expires)) if float(expires).is_integer() else str(expires)]
+    if cookie.get("httpOnly"):
+        argv.append("--httpOnly")
+    if cookie.get("secure"):
+        argv.append("--secure")
+    argv += ["--", str(cookie["name"]), str(cookie.get("value", ""))]
+    return argv
+
+
+def _load_cookies() -> list[dict[str, Any]] | None:
+    """The stored cookies, or ``None`` when there is no readable state file."""
+    try:
+        data = json.loads(storage_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    cookies = data.get("cookies") if isinstance(data, dict) else None
+    if not isinstance(cookies, list):
+        return None
+    return [c for c in cookies if isinstance(c, dict) and c.get("name") and c.get("domain")]
+
+
+def _inject_into_session(
+    session_name: str, overrides: Mapping[str, str], cookies: Iterable[Mapping[str, Any]]
+) -> str:
+    """Send every cookie to one live session over its control socket; ``""`` or a reason.
+
+    One ``playwright-cli -s=<name> cookie-set ...`` per cookie, each bounded by
+    :data:`_CLI_TIMEOUT_S`, stopping at the first failure so a dead socket costs
+    one spawn rather than one per cookie. The daemon does ``addCookies``; it
+    opens no file. The reason is value-free by construction (:func:`_run_cli`).
+    """
+    command = cli_command()
+    if command is None:
+        return "playwright-cli is not installed"
+    env = {**cli_env(), **overrides}
+    for cookie in cookies:
+        ok, reason = _run_cli([*command, f"-s={session_name}", *_cookie_set_argv(cookie)], env)
+        if not ok:
+            return reason
+    return ""
+
+
+def inject_into_live_sessions() -> dict[str, Any]:
+    """Inject the stored cookies into every live ``kc-*`` session, best effort.
+
+    The import handler's half of the two injection points (the
+    :class:`SessionWatcher` is the other). NEVER raises. Returns ``{"loaded":
+    [names], "failed": {name: reason}}`` plus a one-line ``note`` whenever
+    NOTHING loaded, so the caller can show why rather than an empty success.
+    Also records the sockets it reached with the watcher, so the next tick does
+    not repeat the work.
+    """
+    if cli_command() is None:
+        return {"loaded": [], "failed": {}, "note": "playwright-cli is not installed"}
+    cookies = _load_cookies()
+    if not cookies:
+        return {"loaded": [], "failed": {}, "note": "no imported cookies to apply"}
+    sockets = _live_sockets()
+    sessions = _live_sessions()
+    if not sessions:
+        return {
+            "loaded": [],
+            "failed": {},
+            "note": "no live browser sessions; cookies apply to new sessions automatically",
+        }
+    loaded: list[str] = []
+    failed: dict[str, str] = {}
+    # Align the watcher with the file just written, so the sockets recorded
+    # below belong to THIS state and its next tick does not redo them.
+    _WATCHER.sync_state()
+    for name, overrides in sessions.items():
+        reason = _inject_into_session(name, overrides, cookies)
+        if reason:
+            failed[name] = reason
+        else:
+            loaded.append(name)
+            key = sockets.get(name)
+            if key is not None:
+                _WATCHER.mark_injected(key)
+    result: dict[str, Any] = {"loaded": loaded, "failed": failed}
+    if not loaded:
+        result["note"] = (
+            "no open browser session accepted the cookies; they apply to new "
+            "sessions automatically"
+        )
+    return result
+
+
+def clear_live_sessions() -> dict[str, Any]:
+    """Clear the cookies of every live ``kc-*`` session, best effort.
+
+    Companion of :func:`clear_storage_state`: deleting the file stops NEW
+    sessions from receiving the cookies, but a browser already open stays signed
+    in until it is closed. This runs ``playwright-cli -s=<name> cookie-clear``
+    on each candidate session so a clear from the dashboard means what it says,
+    and forgets the watcher's record so a later import injects again. NEVER
+    raises. Returns ``{"cleared": [names], "failed": {name: reason}}`` plus a
+    ``note`` when there was nothing to clear.
+    """
+    _WATCHER.reset()
+    if cli_command() is None:
+        return {"cleared": [], "failed": {}, "note": "playwright-cli is not installed"}
+    sessions = _live_sessions()
+    if not sessions:
+        return {"cleared": [], "failed": {}, "note": "no live browser sessions"}
+    cleared, failed = _run_on_sessions(["cookie-clear"], sessions)
+    return {"cleared": cleared, "failed": failed}
+
+
+# ── SessionWatcher: cookies for daemons that appear after the import ─────────
+
+
+class SessionWatcher:
+    """Gateway-side thread that injects the stored cookies into new daemon sockets.
+
+    Invariant 1 (the module docstring) rules out starting a daemon for the agent,
+    so a session the agent opens AFTER an import has to be reached once it
+    exists. Every :data:`WATCH_INTERVAL_S` seconds the watcher lists
+    ``pw/<8hex>/s/cli/*.sock`` and, for any socket it has not injected into yet
+    (keyed by path + inode + ctime), runs ``cookie-set`` per cookie over that
+    socket and records the key. It only does work while the storage-state file
+    exists; when the file's mtime changes (a re-import) the record is dropped so
+    every live session is injected again, and :meth:`reset` (the clear handler)
+    drops it too.
+
+    Entirely off the event loop: a daemon thread the aiohttp app only starts and
+    stops. Bounded: at most :data:`WATCH_MAX_SESSIONS_PER_TICK` sessions per
+    tick, :data:`_CLI_TIMEOUT_S` per cookie, :data:`WATCH_MAX_ATTEMPTS` tries per
+    socket. Never raises out of a tick; everything is logged at debug.
+    """
+
+    def __init__(self, interval: float = WATCH_INTERVAL_S) -> None:
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._done: set[SocketKey] = set()
+        self._attempts: dict[SocketKey, int] = {}
+        self._state_sig: tuple[int, int] | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- record ---------------------------------------------------------------
+
+    def mark_injected(self, key: SocketKey) -> None:
+        """Record that *key* already carries the current cookies."""
+        with self._lock:
+            self._done.add(key)
+            self._attempts.pop(key, None)
+
+    def reset(self) -> None:
+        """Forget every injected socket, so the next tick with a file injects again."""
+        with self._lock:
+            self._done.clear()
+            self._attempts.clear()
+            self._state_sig = None
+
+    def injected(self) -> frozenset[SocketKey]:
+        """The sockets recorded as injected (for tests and diagnostics)."""
+        with self._lock:
+            return frozenset(self._done)
+
+    def sync_state(self) -> bool:
+        """Align the record with the state file; ``True`` when a file exists.
+
+        A changed mtime/size (a re-import) drops the record so every live
+        session is due again; a missing file drops it too, since a later import
+        must reach every session. Called by the import path before it records
+        what it reached, and by every tick.
+        """
+        try:
+            st = storage_state_path().stat()
+        except OSError:
+            self.reset()
+            return False
+        sig = (st.st_mtime_ns, st.st_size)
+        with self._lock:
+            if sig != self._state_sig:
+                self._done.clear()
+                self._attempts.clear()
+                self._state_sig = sig
+        return True
+
+    # -- one pass -------------------------------------------------------------
+
+    def tick(self) -> int:
+        """One pass; returns how many sessions were injected into. Never raises."""
+        try:
+            return self._tick()
+        except Exception:  # noqa: BLE001 - a watcher pass must never take the thread down
+            logger.debug("browser cookie watcher tick failed", exc_info=True)
+            return 0
+
+    def _tick(self) -> int:
+        if not self.sync_state():
+            return 0
+        sockets = _live_sockets()
+        if not sockets:
+            return 0
+        pending: list[tuple[str, SocketKey]] = []
+        with self._lock:
+            for name, key in sockets.items():
+                if key in self._done or self._attempts.get(key, 0) >= WATCH_MAX_ATTEMPTS:
+                    continue
+                pending.append((name, key))
+            # Drop records for sockets that no longer exist, so the sets stay
+            # bounded by the live population.
+            live = set(sockets.values())
+            self._done &= live
+            self._attempts = {k: n for k, n in self._attempts.items() if k in live}
+        if not pending:
+            return 0
+        cookies = _load_cookies()
+        if not cookies:
+            return 0
+        injected = 0
+        for name, key in pending[:WATCH_MAX_SESSIONS_PER_TICK]:
+            reason = _inject_into_session(name, _session_env(name), cookies)
+            with self._lock:
+                if reason:
+                    self._attempts[key] = self._attempts.get(key, 0) + 1
+                    logger.debug(
+                        "browser cookie watcher: %s not injected (%s), attempt %d",
+                        name,
+                        reason,
+                        self._attempts[key],
+                    )
+                else:
+                    self._done.add(key)
+                    self._attempts.pop(key, None)
+                    injected += 1
+                    logger.debug(
+                        "browser cookie watcher: injected %d cookies into %s", len(cookies), name
+                    )
+        return injected
+
+    # -- thread ---------------------------------------------------------------
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.tick()
+            self._stop.wait(self._interval)
+
+    def start(self) -> None:
+        """Start the thread (idempotent)."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="browser-cookie-watcher", daemon=True
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the thread and wait for it (idempotent)."""
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+        self._stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+
+#: The one watcher per gateway. The dashboard starts it where the browser-view
+#: cleanup is registered and stops it on cleanup; the handlers only touch its
+#: record.
+_WATCHER = SessionWatcher()
+
+
+def start_session_watcher() -> None:
+    """Start the gateway's cookie watcher (idempotent; safe without a CLI or file)."""
+    _WATCHER.start()
+
+
+def stop_session_watcher() -> None:
+    """Stop the gateway's cookie watcher (idempotent)."""
+    _WATCHER.stop()

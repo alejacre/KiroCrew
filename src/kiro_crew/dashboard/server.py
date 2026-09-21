@@ -30,6 +30,7 @@ from kiro_crew.apps.hooks_integration import (
 from kiro_crew.apps.manager import cleanup_migrated_builtin, register_builtin_apps
 from kiro_crew.autonudge import get_instance as _autonudge_get
 from kiro_crew.autonudge_authz import authorize_and_add_nudge
+from kiro_crew.browser_cli import cookies as browser_cli_cookies
 from kiro_crew.browser_cli import launch as browser_cli_launch
 from kiro_crew.browser_cli import launcher as browser_cli_launcher
 from kiro_crew.browser_cli import snapshots as browser_cli_snapshots
@@ -3274,9 +3275,22 @@ def _register_browser_view_cleanup(app: web.Application, state: DashboardState) 
     owner tag in the name keeps a sibling gateway's browsers out of reach. It
     spawns the CLI, so it runs as a background task rather than gating the port
     bind (the same reasoning as the instances revive below).
+
+    The imported-cookies ``SessionWatcher`` (``browser_cli.cookies``) is started
+    here too and stopped on cleanup: it is the gateway-side thread that injects
+    imported cookies into agent browser daemons that appear after the import,
+    over their control sockets. One per gateway, a daemon thread entirely off
+    the event loop; the app only starts and stops it. Starting it is a no-op in
+    effect until a state file exists, so it costs nothing on a gateway that
+    never imports cookies.
     """
 
     async def _browser_sessions_startup(app_: web.Application) -> None:
+        try:
+            browser_cli_cookies.start_session_watcher()
+        except Exception:  # noqa: BLE001 - startup must not raise
+            logger.debug("browser cookie watcher failed to start", exc_info=True)
+
         async def _reclaim() -> None:
             try:
                 await asyncio.to_thread(browser_cli_launcher.reclaim_stranded)
@@ -3290,6 +3304,10 @@ def _register_browser_view_cleanup(app: web.Application, state: DashboardState) 
         task.add_done_callback(state._background_tasks.discard)
 
     async def _browser_view_shutdown(app_: web.Application) -> None:
+        try:
+            await asyncio.to_thread(browser_cli_cookies.stop_session_watcher)
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("browser cookie watcher stop failed during shutdown", exc_info=True)
         try:
             await asyncio.to_thread(browser_cli_launcher.close_all)
         except Exception:  # noqa: BLE001 - shutdown must not raise
